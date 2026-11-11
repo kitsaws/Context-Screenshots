@@ -1,0 +1,27 @@
+# Python caches & virtual environments
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+.venv/
+venv/
+env/
+
+# PyInstaller build artifacts & binaries (publish ContextScreenshots.exe via GitHub Releases)
+build/
+dist/
+*.exe.old
+*.exe.prev
+*.manifest
+
+# Runtime logs, PID files & local settings
+*.log
+.context_screenshots.pid
+settings.json
+
+# IDE & OS metadata
+.vscode/
+.idea/
+Thumbs.db
+desktop.ini
+

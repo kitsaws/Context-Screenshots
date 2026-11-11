@@ -1,0 +1,7 @@
+pynput>=1.8.0
+watchdog>=5.0.0
+Pillow>=10.0.0
+psutil>=5.9.0
+pywin32>=306
+pystray>=0.19.5
+# pyinstaller>=6.22.3  # Optional: required only to rebuild dist/ContextScreenshots.exe
