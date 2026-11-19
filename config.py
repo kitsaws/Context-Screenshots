@@ -83,12 +83,19 @@ OVERLAY_PROCESSES = {
     'rtsshooks.exe',
     'overwolf.exe',
     'screensplitterhook64app.exe',
+    'discordhook.exe',
+    'discordhookhelper.exe',
+    'discordhookhelper64.exe',
+    'discord-overlay.exe',
+    'discordoverlay.exe',
 }
 
 KNOWN_OVERLAY_TITLES = {
     'discord overlay',
     'discord overlay input trap',
     'discord overlay host',
+    'discord voice overlay',
+    'discord game overlay',
     'geforce in-game overlay',
     'nvidia geforce overlay',
     'steam overlay',

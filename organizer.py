@@ -223,8 +223,8 @@ class ScreenshotHandler(FileSystemEventHandler):
         matching_drag = self.tracker.find_matching_drag(img_w, img_h)
         snip_rect = matching_drag['rect'] if matching_drag else None
 
-        # If no drag matched, check recent click (Window Snip Mode)
-        recent_click = self.tracker.get_recent_click()
+        # If no drag matched, check recent click within 3.5s (Window Snip Mode)
+        recent_click = self.tracker.get_recent_click(max_age=3.5) if not snip_rect else None
         click_pt = recent_click['pt'] if recent_click else None
 
         # Identify application and window

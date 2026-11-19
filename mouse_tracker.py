@@ -11,6 +11,7 @@ import psutil
 from pynput import mouse
 
 from config import SNIP_HOST_PROCESSES
+from window_detector import get_process_name_for_hwnd, is_overlay_window
 
 user32 = ctypes.windll.user32
 dwmapi = ctypes.windll.dwmapi
@@ -69,13 +70,7 @@ class MouseTracker:
             try:
                 hwnd = user32.GetForegroundWindow()
                 if hwnd and user32.IsWindow(hwnd) and user32.IsWindowVisible(hwnd):
-                    pid = wintypes.DWORD()
-                    user32.GetWindowThreadProcessId(hwnd, ctypes.byref(pid))
-                    pname = ""
-                    try:
-                        pname = psutil.Process(pid.value).name().lower()
-                    except Exception:
-                        pass
+                    pname, _ = get_process_name_for_hwnd(hwnd)
 
                     # If the foreground window is Snipping Tool / Shell overlay, DO NOT overwrite!
                     if pname and pname not in SNIP_HOST_PROCESSES:
@@ -86,9 +81,8 @@ class MouseTracker:
                             user32.GetWindowTextW(hwnd, buff, length + 1)
                             title = buff.value.strip()
 
-                        # Do not count transparent overlays as the main foreground window
-                        t_lower = title.lower()
-                        if not ('overlay' in t_lower and pname == 'discord.exe'):
+                        ex_style = user32.GetWindowLongW(hwnd, -20)  # GWL_EXSTYLE
+                        if not is_overlay_window(pname, title, ex_style):
                             rect = wintypes.RECT()
                             res = dwmapi.DwmGetWindowAttribute(hwnd, DWMWA_EXTENDED_FRAME_BOUNDS, ctypes.byref(rect), ctypes.sizeof(rect))
                             if res != 0:
@@ -148,9 +142,10 @@ class MouseTracker:
                         })
                     self._press_point = None
 
-    def find_matching_drag(self, target_w: int, target_h: int, tolerance: int = 12, max_age: float = 12.0):
+    def find_matching_drag(self, target_w: int, target_h: int, tolerance: int = 12, max_age: float = 8.0):
         """
         Match a saved screenshot's dimensions (target_w, target_h) to a recent mouse drag rectangle.
+        Returns None if no drag matches the image size (never falls back to an unrelated drag).
         """
         now = time.time()
         with self._lock:
@@ -167,8 +162,8 @@ class MouseTracker:
                 candidates.sort(key=lambda item: item[0])
                 return candidates[0][1]
 
-            # Fallback 1: If close to another scaling factor (e.g. 1.25x or 1.5x)
-            for scale in [1.25, 1.5, 0.8, 0.67]:
+            # Scaling factor checks: DPI scaling (e.g. 1.25x, 1.5x, 1.75x, 2.0x, 0.8x, 0.67x)
+            for scale in [1.25, 1.5, 1.75, 2.0, 0.8, 0.67]:
                 scaled_w = int(target_w / scale)
                 scaled_h = int(target_h / scale)
                 for d in reversed(self.drags):
@@ -178,16 +173,16 @@ class MouseTracker:
                         if dw <= tolerance and dh <= tolerance:
                             return d
 
-            # Fallback 2: Return most recent drag within max_age if reasonable
-            for d in reversed(self.drags):
-                if (now - d['time']) <= max_age:
-                    return d
-
         return None
 
-    def get_recent_click(self, max_age: float = 12.0):
-        """Return the most recent single click point."""
+    def get_recent_click(self, max_age: float = 3.5):
+        """Return the most recent single click point within max_age seconds."""
         now = time.time()
+        with self._lock:
+            for c in reversed(self.clicks):
+                if (now - c['time']) <= max_age:
+                    return c
+        return None
         with self._lock:
             for c in reversed(self.clicks):
                 if (now - c['time']) <= max_age:

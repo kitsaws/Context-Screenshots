@@ -4,7 +4,9 @@ handling dual/multi-monitor setups, background games, and transparent overlays.
 """
 import ctypes
 from ctypes import wintypes
+import time
 import re
+from pathlib import Path
 from typing import Optional, Dict, List, Tuple
 import psutil
 import logging
@@ -15,6 +17,7 @@ logger = logging.getLogger("ContextScreenshots")
 
 user32 = ctypes.windll.user32
 dwmapi = ctypes.windll.dwmapi
+kernel32 = ctypes.windll.kernel32
 
 # Set DPI awareness for exact pixel matching
 try:
@@ -30,6 +33,40 @@ WS_EX_TRANSPARENT = 0x00000020
 WS_EX_NOACTIVATE = 0x08000000
 
 
+def get_process_name_for_hwnd(hwnd: int) -> Tuple[str, int]:
+    """
+    Get (process_name, pid) for a window handle robustly.
+    Uses Win32 QueryFullProcessImageNameW with PROCESS_QUERY_LIMITED_INFORMATION (0x1000)
+    so elevated games and processes (e.g. Genshin Impact, Valorant, Task Manager)
+    can be read without AccessDenied errors by standard non-elevated user processes.
+    """
+    pid = wintypes.DWORD()
+    user32.GetWindowThreadProcessId(hwnd, ctypes.byref(pid))
+    if not pid.value:
+        return 'unknown', 0
+
+    pname = ""
+    # Method 1: Win32 QueryFullProcessImageNameW with PROCESS_QUERY_LIMITED_INFORMATION
+    h_proc = kernel32.OpenProcess(0x1000, False, pid.value)
+    if h_proc:
+        try:
+            buf = ctypes.create_unicode_buffer(1024)
+            size = wintypes.DWORD(1024)
+            if kernel32.QueryFullProcessImageNameW(h_proc, 0, buf, ctypes.byref(size)):
+                pname = Path(buf.value).name.lower()
+        finally:
+            kernel32.CloseHandle(h_proc)
+
+    # Method 2: psutil fallback
+    if not pname:
+        try:
+            pname = psutil.Process(pid.value).name().lower()
+        except Exception:
+            pass
+
+    return pname or 'unknown', pid.value
+
+
 def is_overlay_window(process_name: str, title: str, ex_style: int) -> bool:
     """
     Check if a window is an overlay or HUD (e.g. Discord Voice Overlay, GeForce Overlay, Steam Overlay).
@@ -43,8 +80,11 @@ def is_overlay_window(process_name: str, title: str, ex_style: int) -> bool:
         return True
 
     # Discord Overlay specifically
-    if p_lower == 'discord.exe' and ('overlay' in t_lower or not title):
-        return True
+    if p_lower == 'discord.exe':
+        if 'overlay' in t_lower or not title or t_lower.startswith('discord overlay'):
+            return True
+        if (ex_style & WS_EX_TRANSPARENT) or ((ex_style & WS_EX_TOOLWINDOW) and (ex_style & WS_EX_NOACTIVATE)):
+            return True
 
     # Known overlay window titles
     for ot in KNOWN_OVERLAY_TITLES:
@@ -110,12 +150,7 @@ def get_visible_windows() -> List[Dict]:
             title = buff.value.strip()
 
         # Process name
-        pid = wintypes.DWORD()
-        user32.GetWindowThreadProcessId(hwnd, ctypes.byref(pid))
-        try:
-            pname = psutil.Process(pid.value).name().lower()
-        except Exception:
-            pname = 'unknown'
+        pname, _ = get_process_name_for_hwnd(hwnd)
 
         if pname in IGNORE_PROCESSES:
             return
@@ -231,21 +266,24 @@ def identify_window_from_snip(
     Uses a 3-tier strategy:
     1. Active foreground window (if snip falls inside it, prevents background games/windows from stealing).
     2. Overlap geometry across visible windows (skipping transparent overlays like Discord Overlay).
-    3. Fallback to active window or prominent desktop window.
+    3. Safe fallback (never dumps unrecognized windows or other monitors into Discord).
     """
     windows = get_visible_windows()
+    now = time.time()
 
     # ---------------------------------------------------------
     # Tier 1: Check Last Active Foreground Window
     # If the user was focused on Chrome, and the snip falls inside Chrome,
     # Chrome wins immediately, regardless of background games like Genshin!
+    # Must have been active recently (within 5 seconds) to avoid stale app hijacking.
     # ---------------------------------------------------------
     if last_active_window and last_active_window.get('rect'):
         active_rect = last_active_window['rect']
         pname = last_active_window.get('process_name', '')
         title = last_active_window.get('title', '')
+        active_age = now - last_active_window.get('time', now)
 
-        if pname not in {'explorer.exe', 'unknown'} and not is_overlay_window(pname, title, 0):
+        if active_age <= 5.0 and pname not in {'explorer.exe', 'unknown', ''} and not is_overlay_window(pname, title, 0):
             # Check rectangular snip inside active window
             if snip_rect:
                 snip_w = snip_rect[2] - snip_rect[0]
@@ -254,20 +292,11 @@ def identify_window_from_snip(
                 overlap = compute_overlap_area(active_rect, snip_rect)
                 overlap_ratio = overlap / snip_area
 
-                # If >= 55% of the snip was taken inside the active window
-                if overlap_ratio >= 0.55:
+                # If >= 50% of the snip was taken inside the active window
+                if overlap_ratio >= 0.50:
                     app_name = get_friendly_app_name(pname)
                     clean_title = clean_window_title(title, app_name)
                     logger.info(f"Target identified via Active Foreground Window: {app_name} ({clean_title}) [overlap={overlap_ratio:.2f}]")
-                    return app_name, clean_title
-
-            # Check click point inside active window (Window Snip Mode)
-            if click_pt:
-                cx, cy = click_pt
-                if active_rect[0] <= cx <= active_rect[2] and active_rect[1] <= cy <= active_rect[3]:
-                    app_name = get_friendly_app_name(pname)
-                    clean_title = clean_window_title(title, app_name)
-                    logger.info(f"Target identified via Click inside Active Window: {app_name} ({clean_title})")
                     return app_name, clean_title
 
             # Check fullscreen snip matching active window monitor
@@ -277,12 +306,35 @@ def identify_window_from_snip(
                 for mon in monitors:
                     mw = mon[2] - mon[0]
                     mh = mon[3] - mon[1]
-                    if abs(mw - img_w) <= 4 and abs(mh - img_h) <= 4:
-                        if compute_overlap_area(active_rect, mon) > 0:
+                    if abs(mw - img_w) <= 8 and abs(mh - img_h) <= 8:
+                        if compute_overlap_area(active_rect, mon) > (mw * mh * 0.35):
                             app_name = get_friendly_app_name(pname)
                             clean_title = clean_window_title(title, app_name)
                             logger.info(f"Target identified via Fullscreen Active Window: {app_name} ({clean_title})")
                             return app_name, clean_title
+
+            # Check click point inside active window (Window Snip Mode ONLY)
+            # Crucial: only match if the click is recent AND the image size matches the window size!
+            if click_pt and active_age <= 4.0:
+                cx, cy = click_pt
+                if active_rect[0] <= cx <= active_rect[2] and active_rect[1] <= cy <= active_rect[3]:
+                    act_w = active_rect[2] - active_rect[0]
+                    act_h = active_rect[3] - active_rect[1]
+                    matches_size = False
+                    if image_size:
+                        img_w, img_h = image_size
+                        for scale in (1.0, 1.25, 1.5, 1.75, 2.0, 0.8, 0.67):
+                            if abs(act_w - int(img_w / scale)) <= 35 and abs(act_h - int(img_h / scale)) <= 35:
+                                matches_size = True
+                                break
+                    else:
+                        matches_size = True
+
+                    if matches_size:
+                        app_name = get_friendly_app_name(pname)
+                        clean_title = clean_window_title(title, app_name)
+                        logger.info(f"Target identified via Window Snip Click in Active Window: {app_name} ({clean_title})")
+                        return app_name, clean_title
 
     # ---------------------------------------------------------
     # Tier 2: Spatial Overlap across Visible Windows (Overlays Skipped)
@@ -300,8 +352,8 @@ def identify_window_from_snip(
             overlap = compute_overlap_area(win['rect'], snip_rect)
             if overlap > 0:
                 overlap_ratio = overlap / snip_area
-                # If this window covers the majority of the snip (> 45%) and is top-most in Z-order
-                if overlap_ratio >= 0.45:
+                # If this window covers the majority of the snip (> 40%) and is top-most in Z-order
+                if overlap_ratio >= 0.40:
                     best_window = win
                     break
                 elif overlap > max_overlap:
@@ -314,18 +366,6 @@ def identify_window_from_snip(
             logger.info(f"Target identified via Geometric Overlap: {app_name} ({clean_title})")
             return app_name, clean_title
 
-    # Match via click coordinate (Window Snip Mode on background/other screen)
-    if click_pt:
-        cx, cy = click_pt
-        for win in windows:
-            r = win['rect']
-            if r[0] <= cx <= r[2] and r[1] <= cy <= r[3]:
-                if win['process_name'] != 'explorer.exe' or win['title'] != 'Program Manager':
-                    app_name = get_friendly_app_name(win['process_name'])
-                    clean_title = clean_window_title(win['title'], app_name)
-                    logger.info(f"Target identified via Click Point: {app_name} ({clean_title})")
-                    return app_name, clean_title
-
     # Match via Fullscreen Snip
     if image_size:
         img_w, img_h = image_size
@@ -334,33 +374,77 @@ def identify_window_from_snip(
         for mon in monitors:
             mw = mon[2] - mon[0]
             mh = mon[3] - mon[1]
-            if abs(mw - img_w) <= 4 and abs(mh - img_h) <= 4:
+            if abs(mw - img_w) <= 8 and abs(mh - img_h) <= 8:
                 matching_monitor = mon
                 break
 
         if matching_monitor:
             for win in windows:
-                if compute_overlap_area(win['rect'], matching_monitor) > 0:
-                    if win['process_name'] != 'explorer.exe':
+                if compute_overlap_area(win['rect'], matching_monitor) > (win['w'] * win['h'] * 0.4):
+                    if win['process_name'] != 'explorer.exe' and win['title']:
                         app_name = get_friendly_app_name(win['process_name'])
                         clean_title = clean_window_title(win['title'], app_name)
                         logger.info(f"Target identified via Fullscreen Monitor: {app_name} ({clean_title})")
                         return app_name, clean_title
 
-    # ---------------------------------------------------------
-    # Tier 3: Fallback
-    # ---------------------------------------------------------
-    if last_active_window and last_active_window.get('process_name') not in {'explorer.exe', 'unknown', ''}:
-        app_name = get_friendly_app_name(last_active_window['process_name'])
-        clean_title = clean_window_title(last_active_window.get('title', ''), app_name)
-        logger.info(f"Target identified via Fallback Active Window: {app_name} ({clean_title})")
-        return app_name, clean_title
+    # Match via click coordinate (Window Snip Mode on background/other screen)
+    # Again, only match if the image dimensions correspond to the clicked window!
+    if click_pt:
+        cx, cy = click_pt
+        for win in windows:
+            r = win['rect']
+            if r[0] <= cx <= r[2] and r[1] <= cy <= r[3]:
+                if win['process_name'] != 'explorer.exe' or win['title'] != 'Program Manager':
+                    matches_size = False
+                    if image_size:
+                        img_w, img_h = image_size
+                        for scale in (1.0, 1.25, 1.5, 1.75, 2.0, 0.8, 0.67):
+                            if abs(win['w'] - int(img_w / scale)) <= 35 and abs(win['h'] - int(img_h / scale)) <= 35:
+                                matches_size = True
+                                break
+                    else:
+                        matches_size = True
 
-    for win in windows:
-        if win['process_name'] not in {'explorer.exe', 'unknown'} and win['title']:
-            app_name = get_friendly_app_name(win['process_name'])
-            clean_title = clean_window_title(win['title'], app_name)
-            logger.info(f"Target identified via Topmost Visible Window: {app_name} ({clean_title})")
-            return app_name, clean_title
+                    if matches_size:
+                        app_name = get_friendly_app_name(win['process_name'])
+                        clean_title = clean_window_title(win['title'], app_name)
+                        logger.info(f"Target identified via Window Snip Click Point: {app_name} ({clean_title})")
+                        return app_name, clean_title
 
+    # ---------------------------------------------------------
+    # Tier 3: Strict Fallback (Never dump unrecognized snips into Discord)
+    # ---------------------------------------------------------
+    # Only fall back to last_active_window if it was active within 5 seconds
+    # AND actually intersects the snip rectangle or captured monitor!
+    if last_active_window and (now - last_active_window.get('time', 0) <= 5.0):
+        pname = last_active_window.get('process_name', '')
+        if pname not in {'explorer.exe', 'unknown', ''}:
+            act_rect = last_active_window.get('rect', (0, 0, 0, 0))
+            is_relevant = False
+            if snip_rect and compute_overlap_area(act_rect, snip_rect) > 0:
+                is_relevant = True
+            elif image_size:
+                for mon in get_all_monitors():
+                    if abs((mon[2] - mon[0]) - image_size[0]) <= 8 and abs((mon[3] - mon[1]) - image_size[1]) <= 8:
+                        if compute_overlap_area(act_rect, mon) > 0:
+                            is_relevant = True
+                            break
+
+            if is_relevant:
+                app_name = get_friendly_app_name(pname)
+                clean_title = clean_window_title(last_active_window.get('title', ''), app_name)
+                logger.info(f"Target identified via Fallback Active Window: {app_name} ({clean_title})")
+                return app_name, clean_title
+
+    # Topmost titled non-explorer window only if snip rectangle intersects it
+    if snip_rect:
+        for win in windows:
+            if win['process_name'] not in {'explorer.exe', 'unknown'} and win['title']:
+                if compute_overlap_area(win['rect'], snip_rect) > 0:
+                    app_name = get_friendly_app_name(win['process_name'])
+                    clean_title = clean_window_title(win['title'], app_name)
+                    logger.info(f"Target identified via Intersecting Visible Window: {app_name} ({clean_title})")
+                    return app_name, clean_title
+
+    logger.info("Target window could not be determined; routing to General.")
     return "General", ""
